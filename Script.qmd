@@ -1,0 +1,308 @@
+---
+title: "Spatial Transcriptomics Analysis of Pancreas in NGT and T2D Donors"
+subtitle: "Replication of Howell et al. (2025) - Scientific Data"
+author: "Analysis Script"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    code-tools: true
+    theme: cosmo
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+  cache: false
+---
+
+# Introduction
+
+This script replicates the analysis performed in **Ravikanth Nanduri et al. (2022)**. this study examined the role of HMGNs in white adipocyte browning by comparing wild-type (WT) mice and cells to genetically derived mice and cells lacking the two major members of the HMGN protein family, HMGN1 and HMGN2 (DKO
+mice).
+The experimental design included WT vs DKO mice, 2 replicates each, at two time points, 0 and 6 days. At day 0, cells were in a preadipocyte state, while at day 6 they had differentiated into adipocytes. Each time point had two replicates of each condition (WT vs DKO), for a total of 8 samples.
+
+## Setup
+
+```{r}
+
+setwd("/run/media/saadat/A/Trainig/GettingStarted_scRNASeq/")
+
+library(Seurat)
+library(tidyverse)
+library(miQC)
+library(scater)
+library(SingleCellExperiment)
+library(presto)
+library(glmGamPoi)
+library(celldex)
+library(SingleR)
+
+```
+
+## Load Data
+
+```{r}
+
+#List files 
+files <- list.files(path="data/",recursive=T,pattern="*.h5")
+
+#Create a list of count matrices
+h5_read <- lapply(paste0("data/",
+                         files), Read10X_h5)
+
+#Assign names to each list element based on file names
+names(h5_read)<- sapply(files, 
+                        function(x){str_split_1(x,"_")[1]},
+                        USE.NAMES = FALSE)
+
+#Create Seurat objects for each sample
+
+# All samples
+adp <- mapply(CreateSeuratObject,counts=h5_read,  
+              project=names(h5_read),
+              MoreArgs = list(min.cells = 3, min.features = 200))
+
+#Merge all samples into a single Seurat object
+adp <- merge(adp[[1]], y = adp[2:length(adp)], 
+                  add.cell.ids = names(adp),project="Adipose")
+
+rm(h5_read)
+
+```
+
+## Adding Metadata
+
+```{r}
+
+adp$condition <- ifelse(str_detect(adp@meta.data$orig.ident, "^W"),
+                        "WT","DKO")
+adp$time_point <- ifelse(str_detect(adp@meta.data$orig.ident, "0"),
+                         "Day 0","Day 6")
+adp$cond_tp <- paste(adp$condition, adp$time_point)
+
+```
+
+```{r}
+
+# Visualization the number of cell counts per sample
+adp@meta.data %>% 
+  ggplot(aes(x=orig.ident, fill=orig.ident)) + 
+  geom_bar(color="black") +
+  stat_count(geom = "text", colour = "black", size = 3.5, 
+            aes(label = ..count..),
+            position=position_stack(vjust=0.5))+
+  theme_classic() +
+  theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  ggtitle("Number of Cells per Sample")
+
+```
+
+# Quality Control
+
+## MiQC Model Fitting
+
+miQC is an adaptive scRNA-seq quality-control method that flags low-quality cells by jointly modeling two common QC signals, the fraction of reads mapping to mitochondrial genes and the number of detected genes—using a probabilistic mixture-model framework, then filtering cells based on each cell’s posterior probability of being “compromised” rather than using fixed, hand-tuned cutoffs
+
+```{r}
+
+mt_genes <- grepl("^mt-",  rownames(adp))
+feature_ctrls <- list(mito = rownames(adp)[mt_genes])
+
+# Converting Seurat object to SingleCellExperiment object (handle v5 assay with multiple layers)
+
+DefaultAssay(adp) <- "RNA"
+
+obj <- JoinLayers(adp)
+sce <- as.SingleCellExperiment(obj)
+
+# Running QC metrics
+sce <- scuttle::addPerCellQC(sce, subsets = feature_ctrls)
+plotMetrics(sce)
+
+# MiQC model fitting
+model <- mixtureModel(sce)
+summary(model)
+
+plotModel(sce, model)
+
+# Plotting Filtering Results
+plotFiltering(sce, model)
+sce <- filterCells(sce, model)
+
+# transfer QC metrics back to Seurat
+qc_df <- as.data.frame(SummarizedExperiment::colData(sce))
+adp <- Seurat::AddMetaData(adp, metadata = qc_df)
+adp_filt <- subset(adp, cells = rownames(qc_df)[sce$prob_compromised < 0.75])
+
+```
+
+## Normalization and Scaling
+
+SCTransform is a per-gene regression model that turns raw UMI counts into something close to “variance-stabilized, depth-corrected” expression values.
+
+Each gene is modeled using a negative binomial generalized linear model (GLM) where the sequencing depth (i.e., total UMI count per cell) is used as a covariate. The Pearson residuals from this model are then scaled to have unit variance, resulting in normalized expression values that can be used for downstream analysis.
+
+```{r}
+
+adp_norm <- SCTransform(adp_filt, 
+                        method = "glmGamPoi",  # Improved speed of learning
+                        vst.flavor = "v2",     # Updated regularization
+                        vars.to.regress = "percent.mt",
+                        conserve.memory = TRUE, # To reduce memory usage
+                        verbose = TRUE)
+
+# adp_norm <- readRDS("/run/media/saadat/A/Trainig/GettingStarted_scRNASeq/outputs/adp_norm_mt.rds")
+
+```
+
+## Dimensionality Reduction 
+
+```{r}
+
+adp_norm <- RunPCA(adp_norm, verbose = FALSE, assay = "SCT")
+
+# dimensions 1 to 9
+DimHeatmap(adp_norm, dims = 1:9, cells = 500, balanced = TRUE,ncol=3)
+
+# Elbow Plot
+ElbowPlot(adp_norm,ndims = 50)
+
+```
+
+## Clustering
+
+```{r}
+
+# Nearest Neighbor Graph
+adp_norm <- FindNeighbors(adp_norm, dims = 1:20)
+# Clustering
+adp_norm <- FindClusters(adp_norm, algorithm = 4, resolution = 0.1, random.seed = 111)
+# UMAP Visualization
+adp_norm <- RunUMAP(adp_norm, dims = 1:20)
+
+DimPlot(adp_norm, reduction = "umap", group.by = c("orig.ident", "seurat_clusters","time_point","condition","cond_tp"),
+        alpha=0.4, ncol=2)
+
+```
+
+## Finding cluster markers
+
+```{r}
+
+# Prepping for marker finding
+adp_norm<-PrepSCTFindMarkers(adp_norm,verbose=T)
+
+Idents(adp_norm) = "SCT_snn_res.0.1"
+DefaultAssay(adp_norm) = "SCT"
+
+# Finding markers for all clusters
+adp_norm_markers <- FindAllMarkers(adp_norm, only.pos = TRUE)
+
+#ordering the results
+adp_norm_markers <- adp_norm_markers %>% 
+  arrange(cluster,desc(avg_log2FC), desc(p_val_adj))
+
+#examine a small subset
+adp_norm_markers %>%
+    group_by(cluster) %>%
+    slice_max(n = 5, order_by = avg_log2FC)
+
+```
+
+## Visualizing Marker Expression
+
+```{r}
+
+top20<-adp_norm_markers %>%
+    group_by(cluster) %>%
+    dplyr::filter(avg_log2FC > 1) %>%
+    slice_head(n = 20) %>%
+    ungroup() 
+DoHeatmap(adp_norm, features = top20$gene, slot="scale.data") + NoLegend()
+
+```
+
+## Comparing Time Points
+
+
+```{r}
+
+Idents(adp_norm) = "time_point"
+table(Idents(adp_norm))
+
+# Finding differentially expressed genes between Day 0 and Day 6
+
+TP_de <- FindMarkers(adp_norm,ident.1="Day 6",ident.2="Day 0",test.use="wilcox",
+                     min.pct = 0.2, only.pos = TRUE)
+
+DimPlot(adp_norm,group.by="time_point", alpha=0.4)
+FeaturePlot(adp_norm,features= c("Acta2", "A2m"),order=T)
+```
+
+# Pseudo-bulk Differential Expression Analysis
+
+```{r}
+
+pseudo_adp=AggregateExpression(adp_norm,assays="RNA", return.seurat=T, group.by=c("orig.ident","time_point","condition","cond_tp"))
+
+head(pseudo_adp@assays$RNA$counts)
+
+# Rename cell names
+pseudo_adp = RenameCells(pseudo_adp,new.names=gsub("_.*","",pseudo_adp$orig.ident))
+pseudo_adp$orig.ident=gsub("_.*","",pseudo_adp$orig.ident)
+
+# Differential Expression between Day 0 and Day 6 in pseudo-bulked data
+Idents(pseudo_adp)="time_point"
+bulk_adp_de = FindMarkers(pseudo_adp, ident.1="Day 6", ident.2="Day 0", test.use="DESeq2")
+
+head(bulk_adp_de)
+
+# Visualizing Top Markers per Cluster
+Idents(adp_norm)="SCT_snn_res.0.1"
+DotPlot(adp_norm,features= rownames(bulk_adp_de)[1:10],dot.scale = 3)+coord_flip()
+
+```
+
+# Cell Annotation
+
+###  Annotation by Differential Expressed Gene Markers
+
+From the paper where this data was obtained, the following list of gene markers was obtained:
+Mmp3    : preadipocytes
+Mki67   : proliferating cells
+Fabp4   : differentiating beige adipocytes and differentiated beige adipocytes
+Scd1    : differentiated beige adipocytes
+Ucp1    : differentiated beige adipocytes
+Ppargc1a: differentiated beige adipocytes
+Elovl3  : differentiated beige adipocytes
+Cidea   : differentiated beige adipocytes
+
+```{r}
+
+markers=c("Mmp3","Mki67","Fabp4","Scd1","Ucp1","Ppargc1a","Elovl3","Cidea")
+FeaturePlot(adp_norm,features= markers,ncol=3,order=T)
+
+```
+
+## Annotation using SingleR
+
+```{r}
+
+adp.sce = as.SingleCellExperiment(adp_norm,assay="SCT") #This selects *only* the SCT assay
+mouseRNASeq = celldex::MouseRNAseqData()
+table(mouseRNASeq$label.main)
+
+# Running SingleR
+annot = SingleR(test=adp.sce, ref=mouseRNASeq, labels=mouseRNASeq$label.main)
+# Adding annotations to Seurat object
+table(annot$pruned.labels, useNA="ifany") 
+s
+# Adding annotations to Seurat object
+adp_norm$mouseRNASeq.main = annot$pruned.labels
+
+# Visualizing Annotations
+DimPlot(adp_norm,group.by="mouseRNASeq.main")
+
+```
