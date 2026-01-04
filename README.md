@@ -1,5 +1,4 @@
-# Single-Cell RNA-Seq Analysis: HMGN-Mediated White Adipocyte Browning
-
+# Single-Cell RNA-Seq Analysis
 A comprehensive single-cell RNA-seq analysis pipeline replicating the study by Ravikanth Nanduri et al. (2022) examining the role of HMGN proteins in white adipocyte browning using wild-type (WT) versus HMGN1/HMGN2 double knockout (DKO) mice.
 
 ## Overview
