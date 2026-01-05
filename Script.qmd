@@ -298,7 +298,7 @@ table(mouseRNASeq$label.main)
 annot = SingleR(test=adp.sce, ref=mouseRNASeq, labels=mouseRNASeq$label.main)
 # Adding annotations to Seurat object
 table(annot$pruned.labels, useNA="ifany") 
-s
+
 # Adding annotations to Seurat object
 adp_norm$mouseRNASeq.main = annot$pruned.labels
 
