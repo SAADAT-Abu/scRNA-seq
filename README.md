@@ -158,7 +158,7 @@ The rendered HTML report includes:
 
 If you use this analysis workflow, please cite:
 
-Nanduri, R., et al. (2022). "HMGN proteins in white adipocyte browning."
+Nanduri, R., et al. (2022). "Epigenetic regulation of white adipose tissue plasticity and energy metabolism by nucleosome binding HMGN proteins"
 
 ---
 
