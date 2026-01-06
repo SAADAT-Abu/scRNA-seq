@@ -1,8 +1,7 @@
 ---
-title: "Spatial Transcriptomics Analysis of Pancreas in NGT and T2D Donors"
-subtitle: "Replication of Howell et al. (2025) - Scientific Data"
-author: "Analysis Script"
-date: today
+title: "Single-Cell RNA-seq Analysis of Adipocyte Differentiation"
+subtitle: "Data from Ravikanth Nanduri et al. (2022)"
+author: "Abu Saadat"
 format:
   html:
     toc: true
@@ -38,6 +37,8 @@ library(presto)
 library(glmGamPoi)
 library(celldex)
 library(SingleR)
+library(monocle3)
+library(SeuratWrappers)
 
 ```
 
@@ -209,6 +210,7 @@ adp_norm_markers %>%
     group_by(cluster) %>%
     slice_max(n = 5, order_by = avg_log2FC)
 
+# adp_norm <- readRDS("/run/media/saadat/A/Trainig/GettingStarted_scRNASeq/outputs/adp_norm_Cls.rds")
 ```
 
 ## Visualizing Marker Expression
@@ -294,6 +296,9 @@ adp.sce = as.SingleCellExperiment(adp_norm,assay="SCT") #This selects *only* the
 mouseRNASeq = celldex::MouseRNAseqData()
 table(mouseRNASeq$label.main)
 
+# common <- intersect(rownames(adp.sce), rownames(mouseRNASeq))
+# common <- common[seq_len(min(2000, length(common)))] 
+
 # Running SingleR
 annot = SingleR(test=adp.sce, ref=mouseRNASeq, labels=mouseRNASeq$label.main)
 # Adding annotations to Seurat object
@@ -305,4 +310,146 @@ adp_norm$mouseRNASeq.main = annot$pruned.labels
 # Visualizing Annotations
 DimPlot(adp_norm,group.by="mouseRNASeq.main")
 
+```
+
+## Trajectory Analysis
+
+
+```{r}
+
+# Visualize the subset
+DimPlot(adp_norm, cells.highlight = colnames(adipocytes), 
+        cols.highlight = "red", cols = "gray90") +
+  ggtitle("Highlighted: Adipocyte Subset") 
+
+# Extracting Adipocytes
+adipocytes <- subset(adp_norm, subset = mouseRNASeq.main == "Adipocytes")
+
+# Reprocessing Adipocyte Subset
+
+DefaultAssay(adipocytes) <- "SCT"
+
+adipocytes <- RunPCA(adipocytes, verbose = FALSE)
+
+# Check PCs
+ElbowPlot(adipocytes, ndims = 30)
+DimHeatmap(adipocytes, dims = 1:9, cells = 500, balanced = TRUE, ncol = 3)
+
+# Re-run UMAP with fewer dimensions (since it's a subset)
+adipocytes <- RunUMAP(adipocytes, dims = 1:15, verbose = FALSE)
+
+# Re-cluster at higher resolution to capture sub-populations
+adipocytes <- FindNeighbors(adipocytes, dims = 1:10)
+adipocytes <- FindClusters(adipocytes, resolution = 0.3, random.seed = 111)
+
+# Visualize the subset
+DimPlot(adipocytes, group.by = c("seurat_clusters", "time_point", "condition"),
+        ncol = 3, pt.size = 1)
+
+```
+
+### Monocle3
+
+```{r}
+
+# Convert subset to cell_data_set
+cds_adp <- as.cell_data_set(adipocytes)
+
+# Transfer UMAP from Seurat
+cds_adp@int_colData@listData$reducedDims$UMAP <- 
+  adipocytes@reductions$umap@cell.embeddings
+
+# Set up clusters
+cds_adp@clusters$UMAP$clusters <- adipocytes$seurat_clusters
+
+# Create named partitions vector
+partitions <- rep(1, ncol(cds_adp))
+names(partitions) <- colnames(cds_adp)
+cds_adp@clusters$UMAP$partitions <- partitions
+
+
+# Learn trajectory graph
+cds_adp <- learn_graph(cds_adp, use_partition = FALSE)
+
+# Visualize trajectory
+plot_cells(cds_adp,
+           color_cells_by = "cluster",
+           label_groups_by_cluster = TRUE,
+           label_leaves = TRUE,
+           label_branch_points = TRUE,
+           graph_label_size = 3,
+           cell_size = 1.5)
+
+# Color by time point
+plot_cells(cds_adp,
+           color_cells_by = "time_point",
+           label_cell_groups = FALSE,
+           label_leaves = FALSE,
+           label_branch_points = TRUE,
+           cell_size = 1.5)
+
+# Color by condition (WT vs DKO)
+plot_cells(cds_adp,
+           color_cells_by = "condition",
+           label_cell_groups = FALSE,
+           label_leaves = FALSE,
+           label_branch_points = TRUE,
+           cell_size = 1.5)
+
+```
+
+## Ordering Cells in Pseudotime
+
+```{r}
+
+# Select root cells from Day 0 (preadipocytes)
+root_cells <- colnames(cds_adp)[which(colData(cds_adp)$time_point == "Day 0")]
+
+# Order cells
+cds_adp <- order_cells(cds_adp, root_cells = root_cells)
+
+# Plot pseudotime
+plot_cells(cds_adp,
+           color_cells_by = "pseudotime",
+           label_cell_groups = FALSE,
+           label_leaves = FALSE,
+           label_branch_points = TRUE,
+           cell_size = 1.5)
+
+```
+
+### Identifying Genes that Change with Pseudotime
+
+```{r}
+# Fit models to identify genes that change with pseudotime
+trajectory_genes <- graph_test(cds_adp, neighbor_graph = "principal_graph")
+
+# Ensure rowData has gene_short_name (CRITICAL FIX)
+if(!"gene_short_name" %in% colnames(rowData(cds_adp))) {
+  rowData(cds_adp)$gene_short_name <- rownames(cds_adp)
+}
+# Get top genes
+top_trajectory_genes <- trajectory_genes %>%
+  filter(q_value < 0.05) %>%
+  arrange(desc(morans_I)) %>%
+  head(50) %>%
+  rownames_to_column(var = "gene_short_name")
+
+# Plot top trajectory genes
+plot_cells(cds_adp,
+           genes = head(top_trajectory_genes$gene_short_name, 5),
+           show_trajectory_graph = TRUE,
+           label_cell_groups = FALSE,
+           label_leaves = FALSE)
+
+```
+### Marker Expression over Pseudotime
+
+```{r}
+adipocyte_markers <- c("Mmp3", "Mki67", "Fabp4", "Ucp1", "Cidea", "Ppargc1a")
+
+plot_cells(cds_adp,
+           genes = adipocyte_markers,
+           show_trajectory_graph = TRUE,
+           label_cell_groups = FALSE)
 ```
